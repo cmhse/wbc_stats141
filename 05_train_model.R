@@ -1,320 +1,286 @@
-# Model Training
-# Trains XGBoost model on pitcher-batter matchups
+# Model Training with Proper Holdout Validation
+# Step 1: Train on 2020-2024, validate on 2025
+# Step 2: Retrain on all data (2020-2025) for final deployment
 
 library(tidyverse)
 library(xgboost)
 
-message("Training matchup model\n")
+TRAIN_VALIDATION_MODEL <- TRUE  # Set to FALSE to skip validation model
+TRAIN_FINAL_MODEL <- TRUE       # Set to TRUE to train final model on all data
+
+message("=== Matchup Model Training ===\n")
 
 # Load
+message("Loading data...")
 statcast <- readRDS("data/statcast_data.rds")
 pitcher_features <- readRDS("models/pitcher_features.rds")
 batter_features <- readRDS("models/batter_features.rds")
 pitcher_quality <- readRDS("models/pitcher_quality.rds")
 batter_quality <- readRDS("models/batter_quality.rds")
 
-# Build matchups
-message("Building matchup dataset...")
-
-matchups_all <- statcast %>%
-  filter(!is.na(delta_run_exp)) %>%
-  group_by(pitcher, batter, season, p_throws, stand, level) %>%
-  summarize(
-    n_pitches = n(),
-    actual_delta_re = mean(delta_run_exp, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  filter(n_pitches >= 20)
-
-message(sprintf("Found %s matchups (2020-2025)", format(nrow(matchups_all), big.mark = ",")))
-
-# Join features
-matchup_data <- matchups_all %>%
-  left_join(
-    pitcher_features %>% rename_with(~paste0(., "_p"), -c(pitcher, season, p_throws, stand, level)),
-    by = c("pitcher", "season", "p_throws", "stand", "level")
-  ) %>%
-  left_join(
-    batter_features %>% rename_with(~paste0(., "_b"), -c(batter, season, stand, p_throws, level)),
-    by = c("batter", "season", "stand", "p_throws", "level")
-  ) %>%
-  filter(!is.na(pa_vs_hand_p), !is.na(pa_vs_hand_b))
-
-message(sprintf("Retained %s with complete features\n", format(nrow(matchup_data), big.mark = ",")))
-
-# Add derived features
-message("Computing matchup interactions...")
-
-log5 <- function(p, b) {
-  num <- p * (1 - b)
-  denom <- num + b * (1 - p)
-  return(num / denom)
+# Build matchups function
+build_matchups <- function(data, seasons_filter) {
+  data %>%
+    filter(!is.na(delta_run_exp), season %in% seasons_filter) %>%
+    group_by(pitcher, batter, season, p_throws, stand, level) %>%
+    summarize(
+      n_pitches = n(),
+      actual_delta_re = mean(delta_run_exp, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(n_pitches >= 20)
 }
 
-matchup_data <- matchup_data %>%
-  left_join(pitcher_quality %>% select(pitcher, season, level, pitcher_quality),
-            by = c("pitcher", "season", "level")) %>%
-  left_join(batter_quality %>% select(batter, season, level, batter_quality),
-            by = c("batter", "season", "level")) %>%
-  filter(!is.na(pitcher_quality), !is.na(batter_quality)) %>%
-  mutate(
-    log5_prob = log5(pitcher_quality, batter_quality),
-    log5_base = (0.5 - log5_prob) * 0.2,
-    
-    pitcher_platoon_effect = delta_re_vs_hand_p - (pitcher_quality * (-0.2)),
-    batter_platoon_effect = delta_re_vs_hand_b - (batter_quality * 0.2),
-    
-    # Whiff matchups
-    ff_matchup_whiff = ff_pct_p * ff_whiff_rate_p * ff_whiff_rate_b,
-    si_matchup_whiff = si_pct_p * si_whiff_rate_p * si_whiff_rate_b,
-    fc_matchup_whiff = fc_pct_p * fc_whiff_rate_p * fc_whiff_rate_b,
-    sl_matchup_whiff = sl_pct_p * sl_whiff_rate_p * sl_whiff_rate_b,
-    st_matchup_whiff = st_pct_p * st_whiff_rate_p * st_whiff_rate_b,
-    cu_matchup_whiff = cu_pct_p * cu_whiff_rate_p * cu_whiff_rate_b,
-    kc_matchup_whiff = kc_pct_p * kc_whiff_rate_p * kc_whiff_rate_b,
-    ch_matchup_whiff = ch_pct_p * ch_whiff_rate_p * ch_whiff_rate_b,
-    fs_matchup_whiff = fs_pct_p * fs_whiff_rate_p * fs_whiff_rate_b,
-    
-    # Run matchups
-    ff_matchup_runs = ff_pct_p * (-ff_delta_re_p) * ff_delta_re_b,
-    si_matchup_runs = si_pct_p * (-si_delta_re_p) * si_delta_re_b,
-    fc_matchup_runs = fc_pct_p * (-fc_delta_re_p) * fc_delta_re_b,
-    sl_matchup_runs = sl_pct_p * (-sl_delta_re_p) * sl_delta_re_b,
-    st_matchup_runs = st_pct_p * (-st_delta_re_p) * st_delta_re_b,
-    cu_matchup_runs = cu_pct_p * (-cu_delta_re_p) * cu_delta_re_b,
-    kc_matchup_runs = kc_pct_p * (-kc_delta_re_p) * kc_delta_re_b,
-    ch_matchup_runs = ch_pct_p * (-ch_delta_re_p) * ch_delta_re_b,
-    fs_matchup_runs = fs_pct_p * (-fs_delta_re_p) * fs_delta_re_b,
-    
-    # Stuff advantages
-    ff_velo_advantage = ff_velo_p - 93,
-    si_velo_advantage = si_velo_p - 93,
-    sl_velo_advantage = sl_velo_p - 84,
-    cu_velo_advantage = cu_velo_p - 78,
-    
-    ff_spin_advantage = ff_spin_p - 2200,
-    sl_spin_advantage = sl_spin_p - 2400,
-    cu_spin_advantage = cu_spin_p - 2500,
-    
-    k_rate_diff = k_rate_vs_hand_p - k_rate_vs_hand_b,
-    bb_rate_diff = bb_rate_vs_hand_b,
-    same_hand = as.numeric(p_throws == stand),
-    
-    exit_velo_vs_chase = avg_exit_velo_b * (1 - chase_rate_b),
-    hard_hit_vs_k_diff = hard_hit_rate_b * exp(-k_rate_diff)
-  )
-
-message(sprintf("Final dataset: %s matchups\n", format(nrow(matchup_data), big.mark = ",")))
-
-# Current players (2024-2025)
-message("Identifying current players...")
-
-current_pitchers <- unique(pitcher_features$pitcher[pitcher_features$season >= 2024])
-current_batters <- unique(batter_features$batter[batter_features$season >= 2024])
-
-message(sprintf("Current pitchers: %s", format(length(current_pitchers), big.mark = ",")))
-message(sprintf("Current batters: %s\n", format(length(current_batters), big.mark = ",")))
-
-matchup_data <- matchup_data %>%
-  mutate(
-    pitcher_is_current = pitcher %in% current_pitchers,
-    batter_is_current = batter %in% current_batters,
-    both_current = pitcher_is_current & batter_is_current
-  )
-
-message("Matchup breakdown:")
-message(sprintf("  Both current: %s", format(sum(matchup_data$both_current), big.mark = ",")))
-message(sprintf("  At least one: %s", format(sum(matchup_data$pitcher_is_current | matchup_data$batter_is_current), big.mark = ",")))
-message(sprintf("  Neither: %s\n", format(sum(!matchup_data$pitcher_is_current & !matchup_data$batter_is_current), big.mark = ",")))
-
-# Features
-feature_cols <- c(
-  "log5_base",
-  "pitcher_platoon_effect", "batter_platoon_effect",
+# Add features function
+add_features <- function(matchups, pitcher_feat, batter_feat, pitcher_qual, batter_qual) {
+  matchup_data <- matchups %>%
+    left_join(
+      pitcher_feat %>% rename_with(~paste0(., "_p"), -c(pitcher, season, p_throws, stand, level)),
+      by = c("pitcher", "season", "p_throws", "stand", "level")
+    ) %>%
+    left_join(
+      batter_feat %>% rename_with(~paste0(., "_b"), -c(batter, season, stand, p_throws, level)),
+      by = c("batter", "season", "stand", "p_throws", "level")
+    ) %>%
+    filter(!is.na(pa_vs_hand_p), !is.na(pa_vs_hand_b))
   
-  "ff_matchup_whiff", "si_matchup_whiff", "fc_matchup_whiff",
-  "sl_matchup_whiff", "st_matchup_whiff", "cu_matchup_whiff",
-  "kc_matchup_whiff", "ch_matchup_whiff", "fs_matchup_whiff",
+  # Add log5
+  matchup_data <- matchup_data %>%
+    left_join(
+      pitcher_qual %>% select(pitcher, season, level, pitcher_quality),
+      by = c("pitcher", "season", "level")
+    ) %>%
+    left_join(
+      batter_qual %>% select(batter, season, level, batter_quality),
+      by = c("batter", "season", "level")
+    ) %>%
+    filter(!is.na(pitcher_quality), !is.na(batter_quality))
   
-  "ff_matchup_runs", "si_matchup_runs", "fc_matchup_runs",
-  "sl_matchup_runs", "st_matchup_runs", "cu_matchup_runs",
-  "kc_matchup_runs", "ch_matchup_runs", "fs_matchup_runs",
+  log5 <- function(p, b) {
+    num <- p * (1 - b)
+    denom <- num + b * (1 - p)
+    ifelse(denom == 0, 0.5, num / denom)
+  }
   
-  "ff_velo_advantage", "si_velo_advantage", "sl_velo_advantage", "cu_velo_advantage",
-  "ff_spin_advantage", "sl_spin_advantage", "cu_spin_advantage",
+  matchup_data <- matchup_data %>%
+    mutate(
+      log5_prob = log5(pitcher_quality, batter_quality),
+      log5_base = (0.5 - log5_prob) * 0.2
+    )
   
-  "exit_velo_vs_chase", "hard_hit_vs_k_diff",
-  "k_rate_diff", "bb_rate_diff",
-  
-  "ff_pct_p", "si_pct_p", "fc_pct_p", "sl_pct_p", "st_pct_p",
-  "cu_pct_p", "kc_pct_p", "ch_pct_p", "fs_pct_p",
-  
-  "chase_rate_b", "zone_contact_rate_b", "hard_hit_rate_b", "barrel_rate_b",
-  
-  "same_hand"
-)
+  return(matchup_data)
+}
 
-message(sprintf("Training with %d features\n", length(feature_cols)))
+# Build feature columns (same as original)
+build_feature_matrix <- function(data) {
+  safe_val <- function(x) ifelse(is.na(x) | !is.finite(x), 0, x)
+  
+  # All matchup features
+  features <- data %>%
+    transmute(
+      log5_base = safe_val(log5_base),
+      pitcher_platoon_effect = safe_val(delta_re_vs_hand_p),
+      batter_platoon_effect = safe_val(delta_re_vs_hand_b),
+      
+      # Whiff interactions
+      ff_matchup_whiff = safe_val(ff_pct_p * ff_whiff_rate_p * ff_whiff_rate_b),
+      si_matchup_whiff = safe_val(si_pct_p * si_whiff_rate_p * si_whiff_rate_b),
+      fc_matchup_whiff = safe_val(fc_pct_p * fc_whiff_rate_p * fc_whiff_rate_b),
+      sl_matchup_whiff = safe_val(sl_pct_p * sl_whiff_rate_p * sl_whiff_rate_b),
+      st_matchup_whiff = safe_val(st_pct_p * st_whiff_rate_p * st_whiff_rate_b),
+      cu_matchup_whiff = safe_val(cu_pct_p * cu_whiff_rate_p * cu_whiff_rate_b),
+      kc_matchup_whiff = safe_val(kc_pct_p * kc_whiff_rate_p * kc_whiff_rate_b),
+      ch_matchup_whiff = safe_val(ch_pct_p * ch_whiff_rate_p * ch_whiff_rate_b),
+      fs_matchup_whiff = safe_val(fs_pct_p * fs_whiff_rate_p * fs_whiff_rate_b),
+      
+      # Run value interactions
+      ff_matchup_runs = safe_val(ff_pct_p * ff_delta_re_p * ff_delta_re_b),
+      si_matchup_runs = safe_val(si_pct_p * si_delta_re_p * si_delta_re_b),
+      fc_matchup_runs = safe_val(fc_pct_p * fc_delta_re_p * fc_delta_re_b),
+      sl_matchup_runs = safe_val(sl_pct_p * sl_delta_re_p * sl_delta_re_b),
+      st_matchup_runs = safe_val(st_pct_p * st_delta_re_p * st_delta_re_b),
+      cu_matchup_runs = safe_val(cu_pct_p * cu_delta_re_p * cu_delta_re_b),
+      kc_matchup_runs = safe_val(kc_pct_p * kc_delta_re_p * kc_delta_re_b),
+      ch_matchup_runs = safe_val(ch_pct_p * ch_delta_re_p * ch_delta_re_b),
+      fs_matchup_runs = safe_val(fs_pct_p * fs_delta_re_p * fs_delta_re_b),
+      
+      # Hard hit interactions
+      ff_matchup_hard_hit = safe_val(ff_pct_p * ff_hard_hit_rate_b),
+      si_matchup_hard_hit = safe_val(si_pct_p * si_hard_hit_rate_b),
+      fc_matchup_hard_hit = safe_val(fc_pct_p * fc_hard_hit_rate_b),
+      sl_matchup_hard_hit = safe_val(sl_pct_p * sl_hard_hit_rate_b),
+      st_matchup_hard_hit = safe_val(st_pct_p * st_hard_hit_rate_b),
+      cu_matchup_hard_hit = safe_val(cu_pct_p * cu_hard_hit_rate_b),
+      kc_matchup_hard_hit = safe_val(kc_pct_p * kc_hard_hit_rate_b),
+      ch_matchup_hard_hit = safe_val(ch_pct_p * ch_hard_hit_rate_b),
+      fs_matchup_hard_hit = safe_val(fs_pct_p * fs_hard_hit_rate_b),
+      
+      # Barrel interactions  
+      ff_matchup_barrel = safe_val(ff_pct_p * ff_barrel_rate_b),
+      si_matchup_barrel = safe_val(si_pct_p * si_barrel_rate_b),
+      fc_matchup_barrel = safe_val(fc_pct_p * fc_barrel_rate_b),
+      sl_matchup_barrel = safe_val(sl_pct_p * sl_barrel_rate_b),
+      st_matchup_barrel = safe_val(st_pct_p * st_barrel_rate_b),
+      cu_matchup_barrel = safe_val(cu_pct_p * cu_barrel_rate_b),
+      kc_matchup_barrel = safe_val(kc_pct_p * kc_barrel_rate_b),
+      ch_matchup_barrel = safe_val(ch_pct_p * ch_barrel_rate_b),
+      fs_matchup_barrel = safe_val(fs_pct_p * fs_barrel_rate_b),
+      
+      # Velo/spin advantages
+      ff_velo_advantage = safe_val(ff_velo_p - 93),
+      si_velo_advantage = safe_val(si_velo_p - 93),
+      sl_velo_advantage = safe_val(sl_velo_p - 84),
+      cu_velo_advantage = safe_val(cu_velo_p - 78),
+      
+      ff_spin_advantage = safe_val(ff_spin_p - 2200),
+      sl_spin_advantage = safe_val(sl_spin_p - 2400),
+      cu_spin_advantage = safe_val(cu_spin_p - 2500),
+      
+      # Derived interactions
+      exit_velo_vs_chase = safe_val(avg_exit_velo_b * (1 - chase_rate_b)),
+      hard_hit_vs_k_diff = safe_val(hard_hit_rate_b * exp(-(k_rate_vs_hand_p - k_rate_vs_hand_b))),
+      
+      k_rate_diff = safe_val(k_rate_vs_hand_p - k_rate_vs_hand_b),
+      bb_rate_diff = safe_val(bb_rate_vs_hand_b),
+      
+      # Pitcher pitch mix
+      ff_pct_p = safe_val(ff_pct_p),
+      si_pct_p = safe_val(si_pct_p),
+      fc_pct_p = safe_val(fc_pct_p),
+      sl_pct_p = safe_val(sl_pct_p),
+      st_pct_p = safe_val(st_pct_p),
+      cu_pct_p = safe_val(cu_pct_p),
+      kc_pct_p = safe_val(kc_pct_p),
+      ch_pct_p = safe_val(ch_pct_p),
+      fs_pct_p = safe_val(fs_pct_p),
+      
+      # Batter characteristics
+      chase_rate_b = safe_val(chase_rate_b),
+      zone_contact_rate_b = safe_val(zone_contact_rate_b),
+      hard_hit_rate_b = safe_val(hard_hit_rate_b),
+      barrel_rate_b = safe_val(barrel_rate_b),
+      
+      same_hand = as.numeric(p_throws == stand)
+    )
+  
+  return(features)
+}
 
-# Load best parameters if available, otherwise use defaults
-if (file.exists("models/best_params.rds")) {
-  message("Loading tuned hyperparameters...")
-  best_params <- readRDS("models/best_params.rds")
+# ==================== STEP 1: TRAIN ON 2020-2024, VALIDATE ON 2025 ====================
+
+if (TRAIN_VALIDATION_MODEL) {
+  message("\n=== STEP 1: Training Validation Model (2020-2024) ===\n")
+  
+  # Build training data (2020-2024)
+  message("Building TRAINING matchups (2020-2024)...")
+  matchups_train <- build_matchups(statcast, 2020:2024)
+  message(sprintf("Found %s training matchups", format(nrow(matchups_train), big.mark = ",")))
+  
+  matchup_train_data <- add_features(matchups_train, pitcher_features, batter_features, 
+                                     pitcher_quality, batter_quality)
+  message(sprintf("Retained %s with complete features\n", format(nrow(matchup_train_data), big.mark = ",")))
+  
+  # Build feature matrix
+  message("Building feature matrix...")
+  X_train <- build_feature_matrix(matchup_train_data)
+  y_train <- matchup_train_data$actual_delta_re
+  
+  feature_cols <- colnames(X_train)
+  
+  # Train model
+  message("Training XGBoost model...")
+  dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+  
   params <- list(
     objective = "reg:squarederror",
-    max_depth = best_params$max_depth,
-    eta = best_params$eta,
-    min_child_weight = best_params$min_child_weight,
-    subsample = best_params$subsample,
-    colsample_bytree = best_params$colsample_bytree
-  )
-  message(sprintf("Using tuned params: depth=%d, eta=%.3f, min_child_weight=%d, subsample=%.2f, colsample=%.2f\n",
-                  params$max_depth, params$eta, params$min_child_weight, 
-                  params$subsample, params$colsample_bytree))
-} else {
-  message("Using default hyperparameters (run tune_hyperparameters.R to optimize)")
-  params <- list(
-    objective = "reg:squarederror",
-    max_depth = 4,
     eta = 0.05,
+    max_depth = 6,
     subsample = 0.8,
-    colsample_bytree = 0.8
-  )
-  message("Default params: depth=4, eta=0.05, subsample=0.8, colsample=0.8\n")
-}
-
-# Train with 5-fold CV
-message("Training with 5-fold cross-validation...")
-
-set.seed(42)
-n_folds <- 5
-matchup_data$fold <- sample(rep(1:n_folds, length.out = nrow(matchup_data)))
-
-all_predictions <- data.frame(
-  actual = numeric(nrow(matchup_data)),
-  log5_pred = numeric(nrow(matchup_data)),
-  hybrid_pred = numeric(nrow(matchup_data)),
-  fold = integer(nrow(matchup_data)),
-  both_current = logical(nrow(matchup_data))
-)
-
-for (fold_i in 1:n_folds) {
-  cat(sprintf("Fold %d/%d... ", fold_i, n_folds))
-  
-  train_data <- matchup_data[matchup_data$fold != fold_i, ]
-  val_data <- matchup_data[matchup_data$fold == fold_i, ]
-  
-  train_matrix <- xgb.DMatrix(
-    data = as.matrix(train_data[, feature_cols]),
-    label = train_data$actual_delta_re
+    colsample_bytree = 0.8,
+    min_child_weight = 5
   )
   
-  val_matrix <- xgb.DMatrix(
-    data = as.matrix(val_data[, feature_cols]),
-    label = val_data$actual_delta_re
-  )
-  
-  model_fold <- xgb.train(
+  model_2024 <- xgb.train(
     params = params,
-    data = train_matrix,
-    nrounds = 200,
-    watchlist = list(train = train_matrix, val = val_matrix),
-    early_stopping_rounds = 20,
-    verbose = 0
+    data = dtrain,
+    nrounds = 500,
+    verbose = 1,
+    print_every_n = 50
   )
   
-  val_idx <- which(matchup_data$fold == fold_i)
-  all_predictions$actual[val_idx] <- val_data$actual_delta_re
-  all_predictions$log5_pred[val_idx] <- val_data$log5_base
-  all_predictions$hybrid_pred[val_idx] <- predict(model_fold, val_matrix)
-  all_predictions$fold[val_idx] <- fold_i
-  all_predictions$both_current[val_idx] <- val_data$both_current
+  # Save validation model
+  xgb.save(model_2024, "models/matchup_model_2024.json")
+  saveRDS(feature_cols, "models/model_features.rds")
+  message("\nSaved validation model to models/matchup_model_2024.json")
   
-  fold_log5 <- cor(val_data$actual_delta_re, val_data$log5_base)
-  fold_hybrid <- cor(val_data$actual_delta_re, all_predictions$hybrid_pred[val_idx])
-  
-  cat(sprintf("Log5: %.3f | Hybrid: %.3f | Δ: %+.3f\n",
-              fold_log5, fold_hybrid, fold_hybrid - fold_log5))
+  # Feature importance
+  importance <- xgb.importance(model = model_2024, feature_names = feature_cols)
+  write.csv(importance, "models/feature_importance_2024.csv", row.names = FALSE)
+  message("Saved feature importance to models/feature_importance_2024.csv\n")
 }
 
-# Final model
-message("\nTraining final model...")
-full_matrix <- xgb.DMatrix(
-  data = as.matrix(matchup_data[, feature_cols]),
-  label = matchup_data$actual_delta_re
-)
+# ==================== STEP 2: RETRAIN ON ALL DATA (2020-2025) ====================
 
-final_model <- xgb.train(
-  params = params,
-  data = full_matrix,
-  nrounds = 150,
-  verbose = 0
-)
-
-# Evaluate
-message("\n=== Results (All Matchups) ===\n")
-
-log5_cor <- cor(all_predictions$actual, all_predictions$log5_pred)
-hybrid_cor <- cor(all_predictions$actual, all_predictions$hybrid_pred)
-
-message(sprintf("Log5:   %.3f", log5_cor))
-message(sprintf("Hybrid: %.3f", hybrid_cor))
-message(sprintf("Improvement: %+.3f (%.1f%% better)\n",
-                hybrid_cor - log5_cor, 100 * (hybrid_cor - log5_cor) / log5_cor))
-
-message("=== Results (Current Players Only) ===\n")
-
-current_preds <- all_predictions %>% filter(both_current)
-
-if (nrow(current_preds) > 0) {
-  log5_cor_current <- cor(current_preds$actual, current_preds$log5_pred)
-  hybrid_cor_current <- cor(current_preds$actual, current_preds$hybrid_pred)
+if (TRAIN_FINAL_MODEL) {
+  message("\n=== STEP 2: Training Final Model (2020-2025) ===\n")
   
-  message(sprintf("Matchups: %s", format(nrow(current_preds), big.mark = ",")))
-  message(sprintf("Log5:   %.3f", log5_cor_current))
-  message(sprintf("Hybrid: %.3f", hybrid_cor_current))
-  message(sprintf("Improvement: %+.3f\n", hybrid_cor_current - log5_cor_current))
-}
-
-# Tier analysis
-all_predictions <- all_predictions %>%
-  mutate(hybrid_quintile = ntile(hybrid_pred, 5))
-
-tiers <- all_predictions %>%
-  group_by(hybrid_quintile) %>%
-  summarize(
-    n = n(),
-    avg_actual = mean(actual),
-    avg_pred = mean(hybrid_pred),
-    .groups = "drop"
+  # Build ALL data
+  message("Building FULL matchups (2020-2025)...")
+  matchups_all <- build_matchups(statcast, 2020:2025)
+  message(sprintf("Found %s total matchups", format(nrow(matchups_all), big.mark = ",")))
+  
+  matchup_all_data <- add_features(matchups_all, pitcher_features, batter_features,
+                                   pitcher_quality, batter_quality)
+  message(sprintf("Retained %s with complete features\n", format(nrow(matchup_all_data), big.mark = ",")))
+  
+  # Build feature matrix
+  message("Building feature matrix...")
+  X_all <- build_feature_matrix(matchup_all_data)
+  y_all <- matchup_all_data$actual_delta_re
+  
+  feature_cols <- colnames(X_all)
+  
+  # Train model
+  message("Training XGBoost model on ALL data...")
+  dall <- xgb.DMatrix(data = as.matrix(X_all), label = y_all)
+  
+  params <- list(
+    objective = "reg:squarederror",
+    eta = 0.05,
+    max_depth = 6,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    min_child_weight = 5
   )
+  
+  model_final <- xgb.train(
+    params = params,
+    data = dall,
+    nrounds = 500,
+    verbose = 1,
+    print_every_n = 50
+  )
+  
+  # Save final model (this is what the app uses)
+  xgb.save(model_final, "models/matchup_model.json")
+  saveRDS(feature_cols, "models/model_features.rds")
+  message("\nSaved FINAL model to models/matchup_model.json")
+  
+  # Feature importance
+  importance <- xgb.importance(model = model_final, feature_names = feature_cols)
+  write.csv(importance, "models/feature_importance.csv", row.names = FALSE)
+  message("Saved feature importance to models/feature_importance.csv\n")
+  
+  # Get current players for app
+  current_pitchers <- unique(pitcher_features$pitcher[pitcher_features$season >= 2024])
+  current_batters <- unique(batter_features$batter[batter_features$season >= 2024])
+  
+  saveRDS(current_pitchers, "models/current_pitchers.rds")
+  saveRDS(current_batters, "models/current_batters.rds")
+  message("Saved current player lists\n")
+}
 
-tier_cor <- cor(tiers$avg_pred, tiers$avg_actual)
-
-message("Tier Performance:")
-print(tiers)
-message(sprintf("\nTier correlation: %.3f\n", tier_cor))
-
-# Feature importance
-importance <- xgb.importance(model = final_model)
-message("Top 20 Features:")
-print(head(importance, 20))
-
-# Save
-message("\n=== Saving ===")
-xgb.save(final_model, "models/matchup_model.json")
-saveRDS(feature_cols, "models/model_features.rds")
-write.csv(all_predictions, "models/predictions.csv", row.names = FALSE)
-saveRDS(matchup_data, "models/matchup_data.rds")
-
-saveRDS(list(
-  pitchers = current_pitchers,
-  batters = current_batters
-), "models/current_players.rds")
-
-message("\nModel training complete!")
-message(sprintf("  %s total matchups", format(nrow(matchup_data), big.mark = ",")))
-message(sprintf("  %s current player matchups", format(sum(matchup_data$both_current), big.mark = ",")))
-message(sprintf("  %d features", length(feature_cols)))
-message(sprintf("  %.3f correlation", hybrid_cor))
-message(sprintf("  %.3f tier correlation", tier_cor))
+message("\n=== TRAINING COMPLETE ===")
+message("Next steps:")
+message("1. Run validate_model_2025.R to validate the 2024 model on 2025 data")
+message("2. Use matchup_model.json (final model) in the Shiny app")

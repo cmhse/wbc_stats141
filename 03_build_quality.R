@@ -21,7 +21,7 @@ pitcher_quality <- statcast %>%
     delta_re_per_pa = mean(delta_run_exp, na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  filter(pa >= 50) %>%
+  filter(pa >= 30) %>%  # Lowered from 50 to include more AAA/fringe players
   mutate(
     pitcher_quality = 0.5 - (delta_re_per_pa * 2.5),
     pitcher_quality = pmax(0.2, pmin(0.8, pitcher_quality))
@@ -44,7 +44,7 @@ batter_quality <- statcast %>%
     delta_re_per_pa = mean(delta_run_exp, na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  filter(pa >= 50) %>%
+  filter(pa >= 30) %>%  # Lowered from 50 to include more AAA/fringe players
   mutate(
     batter_quality = 0.5 + (delta_re_per_pa * 2.5),
     batter_quality = pmax(0.2, pmin(0.8, batter_quality))

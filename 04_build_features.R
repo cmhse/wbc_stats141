@@ -21,8 +21,8 @@ pitcher_features <- statcast %>%
   summarize(
     pa_vs_hand = n_distinct(paste(game_pk, at_bat_number)),
     
-    # Results
-    delta_re_vs_hand = mean(delta_run_exp, na.rm = TRUE),
+    # Results (flip sign since delta_run_exp is batter-centric)
+    delta_re_vs_hand = mean(-delta_run_exp, na.rm = TRUE),  # Flip for pitcher perspective
     k_rate_vs_hand = sum(events %in% c("strikeout", "strikeout_double_play"), na.rm = TRUE) / pa_vs_hand,
     
     # Arsenal
@@ -36,16 +36,16 @@ pitcher_features <- statcast %>%
     ch_pct = mean(pitch_type == "CH", na.rm = TRUE),
     fs_pct = mean(pitch_type == "FS", na.rm = TRUE),
     
-    # Run values
-    ff_delta_re = mean(delta_run_exp[pitch_type == "FF"], na.rm = TRUE),
-    si_delta_re = mean(delta_run_exp[pitch_type == "SI"], na.rm = TRUE),
-    fc_delta_re = mean(delta_run_exp[pitch_type == "FC"], na.rm = TRUE),
-    sl_delta_re = mean(delta_run_exp[pitch_type == "SL"], na.rm = TRUE),
-    st_delta_re = mean(delta_run_exp[pitch_type == "ST"], na.rm = TRUE),
-    cu_delta_re = mean(delta_run_exp[pitch_type == "CU"], na.rm = TRUE),
-    kc_delta_re = mean(delta_run_exp[pitch_type == "KC"], na.rm = TRUE),
-    ch_delta_re = mean(delta_run_exp[pitch_type == "CH"], na.rm = TRUE),
-    fs_delta_re = mean(delta_run_exp[pitch_type == "FS"], na.rm = TRUE),
+    # Run values (flip sign since delta_run_exp is batter-centric)
+    ff_delta_re = mean(-delta_run_exp[pitch_type == "FF"], na.rm = TRUE),
+    si_delta_re = mean(-delta_run_exp[pitch_type == "SI"], na.rm = TRUE),
+    fc_delta_re = mean(-delta_run_exp[pitch_type == "FC"], na.rm = TRUE),
+    sl_delta_re = mean(-delta_run_exp[pitch_type == "SL"], na.rm = TRUE),
+    st_delta_re = mean(-delta_run_exp[pitch_type == "ST"], na.rm = TRUE),
+    cu_delta_re = mean(-delta_run_exp[pitch_type == "CU"], na.rm = TRUE),
+    kc_delta_re = mean(-delta_run_exp[pitch_type == "KC"], na.rm = TRUE),
+    ch_delta_re = mean(-delta_run_exp[pitch_type == "CH"], na.rm = TRUE),
+    fs_delta_re = mean(-delta_run_exp[pitch_type == "FS"], na.rm = TRUE),
     
     # Whiff rates
     ff_whiff_rate = sum(description %in% c("swinging_strike", "swinging_strike_blocked") & pitch_type == "FF", na.rm = TRUE) / 
@@ -118,7 +118,7 @@ pitcher_features <- statcast %>%
     
     .groups = "drop"
   ) %>%
-  filter(pa_vs_hand >= 20)
+  filter(pa_vs_hand >= 10)  # Lowered from 20 to include more AAA/fringe players
 
 message(sprintf("Created %s pitcher profiles", format(nrow(pitcher_features), big.mark = ",")))
 message(sprintf("  MLB: %s | AAA: %s", 
@@ -168,13 +168,53 @@ batter_features <- statcast %>%
     fs_whiff_rate = sum(description %in% c("swinging_strike", "swinging_strike_blocked") & pitch_type == "FS", na.rm = TRUE) / 
       sum(pitch_type == "FS" & !is.na(description), na.rm = TRUE),
     
+    # Hard hit rate by pitch
+    ff_hard_hit_rate = sum(launch_speed >= 95 & pitch_type == "FF", na.rm = TRUE) / 
+      sum(!is.na(launch_speed) & pitch_type == "FF", na.rm = TRUE),
+    si_hard_hit_rate = sum(launch_speed >= 95 & pitch_type == "SI", na.rm = TRUE) / 
+      sum(!is.na(launch_speed) & pitch_type == "SI", na.rm = TRUE),
+    fc_hard_hit_rate = sum(launch_speed >= 95 & pitch_type == "FC", na.rm = TRUE) / 
+      sum(!is.na(launch_speed) & pitch_type == "FC", na.rm = TRUE),
+    sl_hard_hit_rate = sum(launch_speed >= 95 & pitch_type == "SL", na.rm = TRUE) / 
+      sum(!is.na(launch_speed) & pitch_type == "SL", na.rm = TRUE),
+    st_hard_hit_rate = sum(launch_speed >= 95 & pitch_type == "ST", na.rm = TRUE) / 
+      sum(!is.na(launch_speed) & pitch_type == "ST", na.rm = TRUE),
+    cu_hard_hit_rate = sum(launch_speed >= 95 & pitch_type == "CU", na.rm = TRUE) / 
+      sum(!is.na(launch_speed) & pitch_type == "CU", na.rm = TRUE),
+    kc_hard_hit_rate = sum(launch_speed >= 95 & pitch_type == "KC", na.rm = TRUE) / 
+      sum(!is.na(launch_speed) & pitch_type == "KC", na.rm = TRUE),
+    ch_hard_hit_rate = sum(launch_speed >= 95 & pitch_type == "CH", na.rm = TRUE) / 
+      sum(!is.na(launch_speed) & pitch_type == "CH", na.rm = TRUE),
+    fs_hard_hit_rate = sum(launch_speed >= 95 & pitch_type == "FS", na.rm = TRUE) / 
+      sum(!is.na(launch_speed) & pitch_type == "FS", na.rm = TRUE),
+    
+    # Barrel rate by pitch
+    ff_barrel_rate = sum(launch_speed_angle %in% 5:6 & pitch_type == "FF", na.rm = TRUE) / 
+      sum(!is.na(launch_speed_angle) & pitch_type == "FF", na.rm = TRUE),
+    si_barrel_rate = sum(launch_speed_angle %in% 5:6 & pitch_type == "SI", na.rm = TRUE) / 
+      sum(!is.na(launch_speed_angle) & pitch_type == "SI", na.rm = TRUE),
+    fc_barrel_rate = sum(launch_speed_angle %in% 5:6 & pitch_type == "FC", na.rm = TRUE) / 
+      sum(!is.na(launch_speed_angle) & pitch_type == "FC", na.rm = TRUE),
+    sl_barrel_rate = sum(launch_speed_angle %in% 5:6 & pitch_type == "SL", na.rm = TRUE) / 
+      sum(!is.na(launch_speed_angle) & pitch_type == "SL", na.rm = TRUE),
+    st_barrel_rate = sum(launch_speed_angle %in% 5:6 & pitch_type == "ST", na.rm = TRUE) / 
+      sum(!is.na(launch_speed_angle) & pitch_type == "ST", na.rm = TRUE),
+    cu_barrel_rate = sum(launch_speed_angle %in% 5:6 & pitch_type == "CU", na.rm = TRUE) / 
+      sum(!is.na(launch_speed_angle) & pitch_type == "CU", na.rm = TRUE),
+    kc_barrel_rate = sum(launch_speed_angle %in% 5:6 & pitch_type == "KC", na.rm = TRUE) / 
+      sum(!is.na(launch_speed_angle) & pitch_type == "KC", na.rm = TRUE),
+    ch_barrel_rate = sum(launch_speed_angle %in% 5:6 & pitch_type == "CH", na.rm = TRUE) / 
+      sum(!is.na(launch_speed_angle) & pitch_type == "CH", na.rm = TRUE),
+    fs_barrel_rate = sum(launch_speed_angle %in% 5:6 & pitch_type == "FS", na.rm = TRUE) / 
+      sum(!is.na(launch_speed_angle) & pitch_type == "FS", na.rm = TRUE),
+    
     # Plate discipline
     bb_rate_vs_hand = sum(events == "walk", na.rm = TRUE) / pa_vs_hand,
     chase_rate = sum(type == "S" & description != "called_strike" & 
                        !is.na(zone) & zone > 9, na.rm = TRUE) /
       sum(!is.na(zone) & zone > 9, na.rm = TRUE),
-    zone_contact_rate = sum(description %in% c("foul", "hit_into_play") & !is.na(zone) & zone <= 9, na.rm = TRUE) /
-      sum(!is.na(zone) & zone <= 9, na.rm = TRUE),
+    zone_contact_rate = sum(description %in% c("foul", "hit_into_play", "foul_tip") & !is.na(zone) & zone <= 9, na.rm = TRUE) /
+      sum(description %in% c("foul", "hit_into_play", "foul_tip", "swinging_strike", "swinging_strike_blocked") & !is.na(zone) & zone <= 9, na.rm = TRUE),
     
     # Contact quality
     avg_exit_velo = mean(launch_speed[!is.na(launch_speed)], na.rm = TRUE),
@@ -185,7 +225,7 @@ batter_features <- statcast %>%
     
     .groups = "drop"
   ) %>%
-  filter(pa_vs_hand >= 20)
+  filter(pa_vs_hand >= 10)  # Lowered from 20 to include more AAA/fringe players
 
 message(sprintf("Created %s batter profiles", format(nrow(batter_features), big.mark = ",")))
 message(sprintf("  MLB: %s | AAA: %s\n", 

@@ -188,6 +188,63 @@ for (i in 1:nrow(matchups_2025)) {
     index_score <- (positive_score / baseline_runs) * 100
     score <- round(index_score)
     
+    # === CALIBRATION ADJUSTMENTS ===
+    # 1. Shift to center 100 at league average OPS (0.719)
+    score <- score - 12
+    
+    # 2. Cross-league adjustment (±15 points)
+    pitcher_id <- matchups_2025$pitcher[i]
+    batter_id <- matchups_2025$batter[i]
+    
+    # Try 2025 first, fallback to 2024
+    p_data <- pitcher_quality %>%
+      filter(pitcher == pitcher_id, season == 2025)
+    
+    if (nrow(p_data) == 0) {
+      p_data <- pitcher_quality %>%
+        filter(pitcher == pitcher_id, season == 2024)
+    }
+    
+    b_data <- batter_quality %>%
+      filter(batter == batter_id, season == 2025)
+    
+    if (nrow(b_data) == 0) {
+      b_data <- batter_quality %>%
+        filter(batter == batter_id, season == 2024)
+    }
+    
+    p_level <- "Unknown"
+    if (nrow(p_data) > 0) {
+      total_pa_p <- sum(p_data$pa)
+      mlb_pa_p <- sum(p_data$pa[p_data$level == "MLB"])
+      mlb_pct_p <- mlb_pa_p / total_pa_p
+      
+      if (mlb_pct_p >= 0.40) p_level <- "MLB"
+      else if (mlb_pct_p < 0.25) p_level <- "AAA"
+      else p_level <- "Both"
+    }
+    
+    b_level <- "Unknown"
+    if (nrow(b_data) > 0) {
+      total_pa_b <- sum(b_data$pa)
+      mlb_pa_b <- sum(b_data$pa[b_data$level == "MLB"])
+      mlb_pct_b <- mlb_pa_b / total_pa_b
+      
+      if (mlb_pct_b >= 0.40) b_level <- "MLB"
+      else if (mlb_pct_b < 0.25) b_level <- "AAA"
+      else b_level <- "Both"
+    }
+    
+    # Apply penalty if clear cross-league matchup
+    if (p_level == "AAA" && b_level == "MLB") {
+      score <- score + 15  # MLB batter advantage
+    } else if (p_level == "MLB" && b_level == "AAA") {
+      score <- score - 15  # MLB pitcher advantage
+    }
+    
+    # 3. Clamp to 50-150
+    score <- pmin(pmax(score, 50), 150)
+    
     predictions <- rbind(predictions, data.frame(
       pitcher = matchups_2025$pitcher[i],
       batter = matchups_2025$batter[i],

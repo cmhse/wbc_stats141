@@ -253,7 +253,6 @@ hr {
 # Load model and data
 model <- xgb.load("models/matchup_model.json")
 feature_cols <- readRDS("models/model_features.rds")
-matchup_data_full <- readRDS("models/matchup_data.rds")
 pitcher_features <- readRDS("models/pitcher_features.rds")
 batter_features <- readRDS("models/batter_features.rds")
 pitcher_quality <- readRDS("models/pitcher_quality.rds")
@@ -593,14 +592,66 @@ predict_matchup <- function(pitcher_id, batter_id) {
     
     score <- round(index_score)
     
-    # Clamp score to 50-150 range for better color gradients
-    # Extreme outliers beyond this range are rare and create poor visualizations
+    # === CALIBRATION ADJUSTMENTS ===
+    # 1. Shift to center 100 at league average OPS (0.719)
+    score <- score - 12
+    
+    # 2. Cross-league adjustment (±15 points)
+    # Try 2025 first, fallback to 2024 if no data
+    p_data <- pitcher_quality %>%
+      filter(pitcher == pitcher_id, season == 2025)
+    
+    # Fallback to 2024 if no 2025 data
+    if (nrow(p_data) == 0) {
+      p_data <- pitcher_quality %>%
+        filter(pitcher == pitcher_id, season == 2024)
+    }
+    
+    b_data <- batter_quality %>%
+      filter(batter == batter_id, season == 2025)
+    
+    # Fallback to 2024 if no 2025 data
+    if (nrow(b_data) == 0) {
+      b_data <- batter_quality %>%
+        filter(batter == batter_id, season == 2024)
+    }
+    
+    p_level <- "Unknown"
+    if (nrow(p_data) > 0) {
+      total_pa_p <- sum(p_data$pa)
+      mlb_pa_p <- sum(p_data$pa[p_data$level == "MLB"])
+      mlb_pct_p <- mlb_pa_p / total_pa_p
+      
+      if (mlb_pct_p >= 0.40) p_level <- "MLB"
+      else if (mlb_pct_p < 0.25) p_level <- "AAA"
+      else p_level <- "Both"
+    }
+    
+    b_level <- "Unknown"
+    if (nrow(b_data) > 0) {
+      total_pa_b <- sum(b_data$pa)
+      mlb_pa_b <- sum(b_data$pa[b_data$level == "MLB"])
+      mlb_pct_b <- mlb_pa_b / total_pa_b
+      
+      if (mlb_pct_b >= 0.40) b_level <- "MLB"
+      else if (mlb_pct_b < 0.25) b_level <- "AAA"
+      else b_level <- "Both"
+    }
+    
+    # Apply penalty for clear cross-league matchups
+    if (p_level == "AAA" && b_level == "MLB") {
+      score <- score + 15  # MLB batter advantage
+    } else if (p_level == "MLB" && b_level == "AAA") {
+      score <- score - 15  # MLB pitcher advantage
+    }
+    
+    # 3. Clamp to 50-150 range
     score <- pmin(pmax(score, 50), 150)
     
-    # Now: 100 = league average (OPS ~0.719)
-    #      110 = 10% better than average  
-    #      90 = 10% worse than average
-    #      Clamped to 50-150 range
+    # Now: 100 = league average (OPS 0.719)
+    #      >100 = batter advantage
+    #      <100 = pitcher advantage
+    #      ±15 for cross-league matchups
     
     # Get feature importance-weighted contributions
     # Load global importance scores
@@ -665,8 +716,30 @@ predict_matchup <- function(pitcher_id, batter_id) {
     })
     names(contributions) <- feature_cols
     
-    # Get top 5
-    top_5_idx <- order(contributions, decreasing = TRUE)[1:5]
+    # Filter: Only show features favoring the winning side
+    score_favors_batter <- score > 100
+    
+    if (score_favors_batter) {
+      # Batter favored (score > 100): only show POSITIVE contributions
+      filtered_contribs <- contributions[contributions > 0]
+    } else {
+      # Pitcher favored (score < 100): only show NEGATIVE contributions  
+      filtered_contribs <- contributions[contributions < 0]
+    }
+    
+    # Get top 5 by absolute value
+    if (length(filtered_contribs) >= 5) {
+      top_5_names <- names(sort(abs(filtered_contribs), decreasing = TRUE))[1:5]
+      top_5_idx <- match(top_5_names, feature_cols)
+    } else if (length(filtered_contribs) > 0) {
+      # Less than 5 contributions in favored direction
+      top_5_names <- names(sort(abs(filtered_contribs), decreasing = TRUE))
+      top_5_idx <- match(top_5_names, feature_cols)
+    } else {
+      # Edge case: no contributions in favored direction (neutral matchup)
+      top_5_idx <- order(abs(contributions), decreasing = TRUE)[1:5]
+    }
+    
     top_5_features <- feature_cols[top_5_idx]
     
     # Create readable labels

@@ -8,11 +8,25 @@ library(xgboost)
 TRAIN_VALIDATION_MODEL <- TRUE  # Set to FALSE to skip validation model
 TRAIN_FINAL_MODEL <- TRUE       # Set to TRUE to train final model on all data
 
-message("=== Matchup Model Training ===\n")
+message("=== Matchup Model Training (MLB DATA ONLY) ===\n")
 
 # Load
 message("Loading data...")
-statcast <- readRDS("data/statcast_data.rds")
+statcast_all <- readRDS("data/statcast_data.rds")
+
+# FILTER TO MLB ONLY FOR TRAINING
+# This gives cleaner signal by excluding small-sample AAA matchups
+# We still build features/quality for ALL players (MLB + AAA)
+message("Filtering to MLB data only for training...")
+statcast <- statcast_all %>% filter(level == "MLB")
+message(sprintf("  Total pitches: %s", format(nrow(statcast_all), big.mark = ",")))
+message(sprintf("  MLB pitches: %s (%.1f%%)", 
+                format(nrow(statcast), big.mark = ","),
+                100 * nrow(statcast) / nrow(statcast_all)))
+message(sprintf("  AAA excluded: %s (%.1f%%)\n", 
+                format(nrow(statcast_all) - nrow(statcast), big.mark = ","),
+                100 * (nrow(statcast_all) - nrow(statcast)) / nrow(statcast_all)))
+
 pitcher_features <- readRDS("models/pitcher_features.rds")
 batter_features <- readRDS("models/batter_features.rds")
 pitcher_quality <- readRDS("models/pitcher_quality.rds")
